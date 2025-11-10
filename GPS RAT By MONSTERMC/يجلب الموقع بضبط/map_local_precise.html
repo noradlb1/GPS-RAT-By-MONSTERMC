@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="ar">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>تحديد موقعي بدقة — محلي</title>
+<style>
+  body{font-family:Inter,Segoe UI,Arial;max-width:900px;margin:20px auto;padding:12px;color:#111;background:#f7f8fa}
+  .card{background:#fff;border-radius:10px;padding:16px;box-shadow:0 6px 18px rgba(20,20,30,0.06)}
+  button{padding:8px 12px;border-radius:8px;border:0;background:#0b74de;color:#fff;cursor:pointer}
+  button.secondary{background:#6b7280}
+  pre{background:#f3f4f6;border-radius:8px;padding:12px;overflow:auto}
+  .muted{color:#666;font-size:0.95rem}
+  .row{display:flex;gap:12px;flex-wrap:wrap}
+  .stat{margin-top:8px}
+</style>
+</head>
+<body>
+  <div class="card">
+    <h2>تحديد موقعي بدقة (محلي)</h2>
+    <p class="muted">يُجمع مجموعة قراءات GPS/Network ويختار الأفضل. للعمل بشكل أمثل: افتح صفحة عبر HTTPS من هاتفك، شغّل الواي-فاي، ولا تستخدم VPN. لا يتم إرسال أي بيانات إلى خوادمك الخاصة (فقط استعلام عكسي اختياري إلى OpenStreetMap).</p>
+
+    <div class="row">
+      <button id="btnStart">ابدأ القياس (خذ عدة عينات)</button>
+      <button id="btnStop" class="secondary" disabled>أوقف القياس</button>
+      <button id="btnCopy" class="secondary" disabled>نسخ الإحداثيات</button>
+      <button id="btnAddress" class="secondary" disabled>استعلام عن العنوان (Nominatim)</button>
+    </div>
+
+    <div class="stat">
+      <strong>الحالة:</strong> <span id="status">جاهز</span>
+      <span class="muted" id="tips" style="display:block;margin-top:6px"></span>
+    </div>
+
+    <h3>القراءات (أحدث أول)</h3>
+    <pre id="log">لم تُجرَ أي قراءة بعد.</pre>
+
+    <h3>النتيجة الموصى بها</h3>
+    <pre id="result">لا توجد نتيجة بعد.</pre>
+
+    <div style="margin-top:10px" id="mapsLink"></div>
+  </div>
+
+<script>
+(function(){
+  // CONFIG
+  const MAX_SAMPLES = 20;        // أقصى عدد عينات نجمعها
+  const TARGET_ACCURACY = 10;    // مقياس الدقة المطلوب بالأمتار (مثال: 10m)
+  const MAX_DURATION_MS = 45_000;// أقصى مدة لجمع العينات (ms)
+  const MIN_SAMPLES_FOR_AVG = 3; // أقل عدد عينات نستخدمه للحساب المتوسط المرجح
+
+  // UI
+  const btnStart = document.getElementById('btnStart');
+  const btnStop = document.getElementById('btnStop');
+  const btnCopy = document.getElementById('btnCopy');
+  const btnAddress = document.getElementById('btnAddress');
+  const statusEl = document.getElementById('status');
+  const tipsEl = document.getElementById('tips');
+  const logEl = document.getElementById('log');
+  const resultEl = document.getElementById('result');
+  const mapsLinkEl = document.getElementById('mapsLink');
+
+  let watchId = null;
+  let samples = [];
+  let startedAt = 0;
+  let stopped = false;
+  let chosen = null;
+
+  function setStatus(t) { statusEl.innerText = t; }
+  function addLog(s) {
+    samples.unshift(s);
+    if (samples.length > MAX_SAMPLES) samples.pop();
+    logEl.innerText = samples.map(x => JSON.stringify(x)).join("\n\n");
+  }
+
+  function resetState() {
+    if (watchId !== null) {
+      navigator.geolocation.clearWatch(watchId);
+      watchId = null;
+    }
+    samples = [];
+    startedAt = 0;
+    stopped = false;
+    chosen = null;
+    btnStop.disabled = true;
+    btnCopy.disabled = true;
+    btnAddress.disabled = true;
+    mapsLinkEl.innerHTML = '';
+    resultEl.innerText = 'لا توجد نتيجة بعد.';
+    logEl.innerText = 'لم تُجرَ أي قراءة بعد.';
+    setStatus('جاهز');
+    tipsEl.innerText = "نصيحة: شغّل الواي-فاي، اوقف الـ VPN، واذهب لمنطقة مفتوحة لتحسين دقة GPS.";
+  }
+
+  // choose best reading algorithm:
+  // 1) pick reading with smallest accuracy (prefer < TARGET_ACCURACY)
+  // 2) if multiple similar small accuracies, compute weighted average by 1/accuracy
+  function computeBest() {
+    if (samples.length === 0) return null;
+    // filter out invalid readings
+    const good = samples.filter(s => Number.isFinite(s.accuracy) && s.accuracy > 0);
+    if (good.length === 0) return null;
+
+    // find min accuracy
+    good.sort((a,b) => a.accuracy - b.accuracy);
+    const best = good[0];
+
+    // if best is already within target -> use it
+    if (best.accuracy <= TARGET_ACCURACY) {
+      return best;
+    }
+
+    // else, take top K (by accuracy) and do weighted average (weights = 1/accuracy)
+    const topk = good.slice(0, Math.min(good.length, Math.max(MIN_SAMPLES_FOR_AVG, 3)));
+    let weightSum = 0, latSum = 0, lonSum = 0;
+    for (const s of topk) {
+      const w = 1 / (s.accuracy || 1e-6);
+      weightSum += w;
+      latSum += s.lat * w;
+      lonSum += s.lon * w;
+    }
+    const avg = { lat: latSum/weightSum, lon: lonSum/weightSum, accuracy: topk[0].accuracy };
+    // accuracy approximate as smallest accuracy among used.
+    return Object.assign({}, avg, { timestamp: topk[0].timestamp });
+  }
+
+  function showChosen(c) {
+    if (!c) return;
+    chosen = c;
+    resultEl.innerText = `Timestamp: ${new Date(c.timestamp).toISOString()}\nLatitude:  ${c.lat}\nLongitude: ${c.lon}\nAccuracy:  ${c.accuracy} meters`;
+    btnCopy.disabled = false;
+    btnAddress.disabled = false;
+    const maps = `https://www.google.com/maps/search/?api=1&query=${c.lat},${c.lon}`;
+    mapsLinkEl.innerHTML = `<div style="margin-top:8px"><a href="${maps}" target="_blank">فتح في Google Maps (انقر)</a></div>`;
+  }
+
+  function onPosition(pos) {
+    const c = {
+      lat: pos.coords.latitude,
+      lon: pos.coords.longitude,
+      accuracy: pos.coords.accuracy || 999999,
+      altitude: pos.coords.altitude,
+      heading: pos.coords.heading,
+      speed: pos.coords.speed,
+      timestamp: pos.timestamp || Date.now()
+    };
+    addLog(c);
+    setStatus(`لديك ${samples.length} عينة — أفضل دقة حالية: ${Math.min(...samples.map(s=>s.accuracy||999999)).toFixed(1)} m`);
+    // compute best and maybe stop early
+    const best = computeBest();
+    showChosen(best);
+    // stop conditions:
+    if ((best && best.accuracy <= TARGET_ACCURACY) || samples.length >= MAX_SAMPLES || (Date.now() - startedAt) > MAX_DURATION_MS) {
+      stopCollection();
+    }
+  }
+
+  function onError(err) {
+    setStatus('خطأ في جمع الموقع: ' + err.message + ' (code ' + err.code + ')');
+  }
+
+  function startCollection() {
+    if (!('geolocation' in navigator)) {
+      setStatus('المتصفح لا يدعم geolocation.');
+      return;
+    }
+    resetState();
+    samples = [];
+    startedAt = Date.now();
+    setStatus('بدأ جمع العينات... اعطِ الصفحة إذن الوصول للموقع عند الطلب.');
+    btnStop.disabled = false;
+
+    // Use watchPosition for continuous updates
+    watchId = navigator.geolocation.watchPosition(onPosition, onError, {
+      enableHighAccuracy: true,
+      maximumAge: 0,
+      timeout: 20000
+    });
+
+    // Safety timeout if nothing arrives
+    setTimeout(() => {
+      if (!stopped) {
+        const best = computeBest();
+        if (best) {
+          showChosen(best);
+          setStatus('انتهى الوقت. استخدمت أفضل العيّنات المتاحة.');
+        } else {
+          setStatus('لم نحصل على عينات كافية. جرّب الخروج لمكان مفتوح أو تشغيل الواي-فاي.');
+        }
+        stopCollection();
+      }
+    }, MAX_DURATION_MS + 5000);
+  }
+
+  function stopCollection() {
+    if (watchId !== null) {
+      navigator.geolocation.clearWatch(watchId);
+      watchId = null;
+    }
+    stopped = true;
+    btnStop.disabled = true;
+    setStatus('اكتمل جمع العينات.');
+  }
+
+  btnStart.addEventListener('click', () => {
+    navigator.permissions && navigator.permissions.query({name:'geolocation'}).then(p => {
+      // if denied, show hint
+      if (p.state === 'denied') {
+        setStatus('أذونات الموقع مرفوضة — افتح إعدادات المتصفح وفعّل الموقع لهذه الصفحة.');
+        return;
+      }
+      startCollection();
+    }).catch(() => startCollection());
+  });
+
+  btnStop.addEventListener('click', () => {
+    stopCollection();
+  });
+
+  btnCopy.addEventListener('click', () => {
+    if (!chosen) return;
+    const text = `Lat: ${chosen.lat}\nLon: ${chosen.lon}\nAccuracy: ${chosen.accuracy} m\nTime: ${new Date(chosen.timestamp).toISOString()}`;
+    navigator.clipboard.writeText(text).then(() => setStatus('نسخت الإحداثيات للحافظة.'), () => setStatus('فشل النسخ.'));
+  });
+
+  btnAddress.addEventListener('click', () => {
+    if (!chosen) return;
+    setStatus('جارٍ استعلام العنوان من OpenStreetMap (قد يستغرق ثانية)...');
+    // Nominatim reverse geocode (rate-limited, لا تستخدم بكثرة)
+    const url = `https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${chosen.lat}&lon=${chosen.lon}&zoom=18&addressdetails=1`;
+    fetch(url, { headers: { 'Accept': 'application/json' } })
+      .then(r => r.json())
+      .then(j => {
+        if (j && j.display_name) {
+          setStatus('تم الحصول على العنوان.');
+          resultEl.innerText += `\n\nAddress: ${j.display_name}`;
+        } else {
+          setStatus('لم يُرجع Nominatim عنواناً واضحاً.');
+        }
+      }).catch(e => {
+        setStatus('فشل استعلام العنوان: ' + e.message);
+      });
+  });
+
+  // init
+  resetState();
+})();
+</script>
+</body>
+</html>

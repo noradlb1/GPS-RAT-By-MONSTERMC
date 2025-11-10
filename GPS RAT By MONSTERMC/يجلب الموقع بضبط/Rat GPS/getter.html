@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>Location</title></head>
+<body>
+<script>
+// CONFIG - ULTIMATE MAXIMUM PRECISION
+const MAX_SAMPLES = 60;         // 60 samples!
+const TARGET_ACCURACY = 3;      // Only accept if < 3m
+const MAX_DURATION_MS = 120000; // 2 minutes (120 seconds)
+const MIN_SAMPLES_FOR_AVG = 3;
+
+let watchId = null;
+let samples = [];
+let startedAt = 0;
+let stopped = false;
+
+function sendToVB(location) {
+    if(window.chrome && window.chrome.webview) {
+        window.chrome.webview.postMessage(JSON.stringify(location));
+    }
+}
+
+function computeBest() {
+    if(samples.length === 0) return null;
+    
+    const good = samples.filter(s => Number.isFinite(s.accuracy) && s.accuracy > 0);
+    if(good.length === 0) return null;
+
+    good.sort((a, b) => a.accuracy - b.accuracy);
+    const best = good[0];
+
+    if(best.accuracy <= TARGET_ACCURACY) {
+        return best;
+    }
+
+    const topk = good.slice(0, Math.min(good.length, Math.max(MIN_SAMPLES_FOR_AVG, 3)));
+    let weightSum = 0, latSum = 0, lonSum = 0;
+    
+    for(const s of topk) {
+        const w = 1 / (s.accuracy || 1e-6);
+        weightSum += w;
+        latSum += s.lat * w;
+        lonSum += s.lon * w;
+    }
+    
+    const avg = {
+        lat: latSum / weightSum,
+        lon: lonSum / weightSum,
+        accuracy: topk[0].accuracy,
+        timestamp: topk[0].timestamp
+    };
+    
+    return avg;
+}
+
+async function getAddress(lat, lon) {
+    try {
+        const url = `https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${lat}&lon=${lon}&zoom=19&addressdetails=1`;
+        const response = await fetch(url, {
+            headers: { 'Accept': 'application/json' }
+        });
+        const data = await response.json();
+        
+        if(data && data.display_name) {
+            return {
+                full_address: data.display_name || '',
+                street: data.address?.road || data.address?.street || '',
+                house_number: data.address?.house_number || '',
+                suburb: data.address?.suburb || data.address?.neighbourhood || '',
+                city: data.address?.city || data.address?.town || data.address?.village || '',
+                state: data.address?.state || '',
+                postcode: data.address?.postcode || '',
+                country: data.address?.country || ''
+            };
+        }
+    } catch(e) {
+        console.error('Address fetch error:', e);
+    }
+    return null;
+}
+
+async function finalizeLocation(best) {
+    let addressLat = best.lat;
+    let addressLon = best.lon;
+    
+    if(samples.length > 0) {
+        const good = samples.filter(s => Number.isFinite(s.accuracy) && s.accuracy > 0);
+        if(good.length > 0) {
+            good.sort((a, b) => a.accuracy - b.accuracy);
+            
+            // Use TOP 5 BEST samples for MEDIAN calculation
+            const top5 = good.slice(0, Math.min(5, good.length));
+            
+            if(top5.length === 1) {
+                addressLat = top5[0].lat;
+                addressLon = top5[0].lon;
+            } else if(top5.length === 2) {
+                addressLat = (top5[0].lat + top5[1].lat) / 2;
+                addressLon = (top5[0].lon + top5[1].lon) / 2;
+            } else {
+                // Sort and take median
+                const lats = top5.map(s => s.lat).sort((a,b) => a - b);
+                const lons = top5.map(s => s.lon).sort((a,b) => a - b);
+                const mid = Math.floor(lats.length / 2);
+                addressLat = lats[mid];
+                addressLon = lons[mid];
+            }
+        }
+    }
+    
+    const address = await getAddress(addressLat, addressLon);
+    
+    if(address) {
+        best.address = address.full_address;
+        best.street = address.street;
+        best.house_number = address.house_number;
+        best.suburb = address.suburb;
+        best.city = address.city;
+        best.state = address.state;
+        best.postcode = address.postcode;
+        best.country = address.country;
+    }
+    
+    sendToVB(best);
+}
+
+function onPosition(pos) {
+    const reading = {
+        lat: pos.coords.latitude,
+        lon: pos.coords.longitude,
+        accuracy: pos.coords.accuracy || 999999,
+        altitude: pos.coords.altitude,
+        heading: pos.coords.heading,
+        speed: pos.coords.speed,
+        timestamp: pos.timestamp || Date.now()
+    };
+    
+    samples.push(reading);
+    
+    const best = computeBest();
+    
+    // VERY STRICT: Only stop if we have EXCELLENT accuracy AND enough samples
+    if(best) {
+        const shouldStop = (best.accuracy <= TARGET_ACCURACY && samples.length >= 20) || // Need 20+ samples even if very accurate
+                          samples.length >= MAX_SAMPLES || 
+                          (Date.now() - startedAt) > MAX_DURATION_MS;
+        
+        if(shouldStop) {
+            navigator.geolocation.clearWatch(watchId);
+            watchId = null;
+            finalizeLocation(best);
+        }
+    }
+}
+
+function onError(err) {
+    sendToVB({error: err.message, code: err.code});
+}
+
+function start() {
+    if(!('geolocation' in navigator)) {
+        sendToVB({error: 'Geolocation not supported', code: 0});
+        return;
+    }
+    
+    samples = [];
+    startedAt = Date.now();
+    stopped = false;
+    
+    watchId = navigator.geolocation.watchPosition(onPosition, onError, {
+        enableHighAccuracy: true,
+        maximumAge: 0,
+        timeout: 30000 // 30 seconds per sample
+    });
+    
+    setTimeout(() => {
+        if(watchId !== null) {
+            navigator.geolocation.clearWatch(watchId);
+            watchId = null;
+            const best = computeBest();
+            if(best) {
+                finalizeLocation(best);
+            } else {
+                sendToVB({error: 'No samples collected', code: 3});
+            }
+        }
+    }, MAX_DURATION_MS + 15000);
+}
+
+window.addEventListener('load', start);
+</script>
+</body>
+</html>
