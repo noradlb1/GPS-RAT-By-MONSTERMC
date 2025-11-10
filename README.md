@@ -479,6 +479,6 @@ For best results, ensure HTTPS is enabled and users grant location permission.
 
 ## Link-Based: Image
 
-![](Capture.PNG)
+![](URL%20Only/Capture.PNG)
 -- --
-![](Capturee.PNG)
+![](URL%20Only/Capturee.PNG)
